@@ -3,7 +3,7 @@ from emioapi import EmioAPI
 
 
 # Create an EmioAPI instance
-emio = EmioAPI(multiprocess_camera=True)
+emio = EmioAPI(multiprocess_camera=False)
 
 # Connect to the first available Emio device
 if emio.connectToEmioDevice():

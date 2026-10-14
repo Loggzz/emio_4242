@@ -15,7 +15,7 @@ TRACKER_TIMEOUT = 5.0
 TRACKER_SAMPLES = 15
 
 # Recommended extended configuration in the official EMIO lab.
-DEFAULT_COUPLINGS = ("ccw", "cw", "ccw", "cw")
+FIXED_COUPLINGS = ("ccw", "cw", "ccw", "cw")
 COUPLING_NAMES = {
     "cw": "clockwisedown",
     "ccw": "counterclockwisedown",
@@ -43,25 +43,6 @@ class LinearizedKinematics:
         """Anchor later local predictions to the latest measured robot pose."""
         self.reference_angles = np.asarray(joint_angles, dtype=float)
         self.reference_effector = np.asarray(effector_position, dtype=float)
-
-
-def choose_couplings() -> tuple[str, ...]:
-    print("\nChoose the physical mounting of each leg.")
-    print("  cw   = clockwise down")
-    print("  ccw  = counterclockwise down")
-    print("Press Enter to accept the shown default.\n")
-
-    couplings = []
-    for motor, default in enumerate(DEFAULT_COUPLINGS):
-        while True:
-            choice = input(f"Motor {motor} coupling [cw/ccw] ({default}): ").strip().lower()
-            choice = choice or default
-            if choice in COUPLING_NAMES:
-                couplings.append(choice)
-                break
-            print("Please enter 'cw' or 'ccw'.")
-
-    return tuple(couplings)
 
 
 def validate_angles(angles) -> np.ndarray:
@@ -236,8 +217,11 @@ def control_loop(emio, model: LinearizedKinematics) -> None:
 
 
 def main() -> None:
-    couplings = choose_couplings()
-    print("\nMount the four legs exactly as selected and attach one green marker")
+    couplings = FIXED_COUPLINGS
+    print("\nUsing the fixed physical leg configuration:")
+    for motor, coupling in enumerate(couplings):
+        print(f"  Motor {motor}: {COUPLING_NAMES[coupling]}")
+    print("\nMount the four legs exactly as shown and attach one green marker")
     print("to the center of the connector. Calibration moves one motor at a time")
     print("by 3 degrees. Keep hands and obstacles clear of the robot.")
     if input("Type MOVE to connect and begin calibration: ").strip() != "MOVE":
