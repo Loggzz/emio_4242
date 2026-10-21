@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
+# Sofa, Sofa.Core, and the simulation emio package come from EMIO Labs' runSofa runtime.
 dependencies = [
+    "dynamixel-sdk",
     "emioapi",
+    "numpy",
+    "opencv-python",
+    "pyserial",
 ]

@@ -24,11 +24,21 @@ name = "emio"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "dynamixel-sdk" },
     { name = "emioapi" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "pyserial" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "emioapi" }]
+requires-dist = [
+    { name = "dynamixel-sdk" },
+    { name = "emioapi" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "pyserial" },
+]
 
 [[package]]
 name = "emioapi"
