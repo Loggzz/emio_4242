@@ -3,7 +3,7 @@ Emio: sort 6 play-dough objects from the tray's HOME square to their numbered sp
 
 Objects (from the photos) -> spot numbers (edit OBJECT_TO_SPOT if different):
     cheese    -> 2        eggplant -> 1
-    burger    -> 6        sushi    -> 4
+    burger    -> 6        donut    -> 4
     bread     -> 3        tomato   -> 5
 
 Pipeline per object
@@ -48,7 +48,7 @@ SETTLE_POLL  = True       # poll motors.moving and return early if settled
 # =====================================================================
 
 OBJECT_TO_SPOT = {"cheese": 2, "eggplant": 1, "burger": 6,
-                  "sushi": 4, "bread": 3, "tomato": 5}
+                  "donut": 4, "bread": 3, "tomato": 5}
 OBJECTS = list(OBJECT_TO_SPOT)
 
 GREEN_LO, GREEN_HI = (40, 70, 60), (85, 255, 255)
