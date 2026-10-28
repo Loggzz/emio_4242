@@ -38,9 +38,18 @@ from emioapi import EmioAPI
 import movej
 from movej import POSE_SEQUENCE, move_j
 
-# Optional: add  MAX_VELOCITY = [25, 25, 25, 25]  to movej.py to control it
-# there; otherwise we use the value movej.main() uses.
-MAX_VELOCITY = getattr(movej, "MAX_VELOCITY", [25, 25, 25, 25])
+def _velocity_from_movej():
+    """movej.MAX_VELOCITY if defined, else the max_velocity line in movej.main()."""
+    if hasattr(movej, "MAX_VELOCITY"):
+        return list(movej.MAX_VELOCITY)
+    import re
+    src = open(movej.__file__).read()
+    m = re.search(r"max_velocity\s*=\s*\[([^\]]+)\]", src)
+    if m:
+        return [float(x) for x in m.group(1).split(",")]
+    return [25, 25, 25, 25]
+
+MAX_VELOCITY = _velocity_from_movej()
 
 
 def _split_segments(seq):
@@ -71,7 +80,7 @@ def _split_segments(seq):
 HOME_POSE, SEGMENTS = _split_segments(POSE_SEQUENCE)
 print(f"movej.py loaded from: {movej.__file__}  (modified "
       f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(movej.__file__)))})")
-print(f"  {len(POSE_SEQUENCE)} poses, spots {sorted(SEGMENTS)}, hover = {dict(POSE_SEQUENCE).get('hover', '?')}")
+print(f"  {len(POSE_SEQUENCE)} poses, spots {sorted(SEGMENTS)}, max_velocity = {MAX_VELOCITY}")
 POSE_BY_NAME = {n: a for n, a in POSE_SEQUENCE}
 # Pose (name from movej.py) the robot goes to for the FIRST look (and for
 # tune/calibrate/dry) so the gripper is out of the camera's way.
@@ -626,26 +635,40 @@ def main():
         refs = json.load(open(SIG_FILE))
 
         placed = set()
-        for i in range(len(OBJECTS)):
-            if i > 0 and AFTER_PLACE_LOOK is not None:
+        first = True
+        print("Waiting for objects in HOME. Press q in the window (or Ctrl-C) to end.")
+        while len(placed) < len(OBJECTS):
+            if not first and AFTER_PLACE_LOOK is not None:
                 go(emio, AFTER_PLACE_LOOK, POSE_BY_NAME[AFTER_PLACE_LOOK], dry=False)
-            name, dist, _ = look_with_retry(emio.camera, refs)
-            if name is None:
-                print("Stopping:", look_at_home.reason)
-                if "NO TRAY" in look_at_home.reason:
-                    print("  -> the camera can't see the markers from this pose. "
-                          "Set LOOK_POSE to a pose in movej.py where the tray is visible.")
-                break
+            first = False
+
+            # Wait here until an object is classified (or q / Ctrl-C).
+            name = None
+            while name is None:
+                name, dist, _ = look_at_home(emio.camera, refs)
+                if cv2.waitKey(30) & 0xFF == ord("q"):
+                    print("q pressed - ending."); raise KeyboardInterrupt
+                if name is None:
+                    print("  waiting:", look_at_home.reason, end="\r")
+            print()
+
             spot = OBJECT_TO_SPOT[name]
             ru = getattr(classify, "runner_up", ("?", 0))
             print(f"Detected {name} (d={dist:.2f}; next: {ru[0]} d={ru[1]:.2f}) -> spot {spot}")
             if spot in placed:
-                print(f"  spot {spot} already filled — check classification"); break
+                print(f"  spot {spot} already filled - remove the object, waiting...")
+                time.sleep(2); continue
+            # require the same answer twice so a hand/shadow mid-placement isn't picked
+            name2, _, _ = look_at_home(emio.camera, refs)
+            if name2 != name:
+                print("  unstable detection, re-checking..."); continue
             if dry:
                 input("  dry run: move it by hand, then press Enter... ")
                 placed.add(spot); continue
             pick_and_place(emio, spot, dry)
             placed.add(spot)
+            print(f"  done {len(placed)}/{len(OBJECTS)}: {sorted(placed)}")
+        print("All objects placed.")
     except KeyboardInterrupt:
         pass
     finally:
