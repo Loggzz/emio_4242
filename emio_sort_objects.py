@@ -57,13 +57,17 @@ OBJECTS = list(OBJECT_TO_SPOT)
 # and loaded automatically on later runs (overrides the values below).
 MARKER_LO, MARKER_HI = (125, 60, 50), (160, 255, 255)
 MIN_MARKER_AREA = 25
-MIN_TRAY_FRAC   = 0.03         # tray must cover >= this fraction of the frame
+MIN_TRAY_FRAC   = 0.005        # tray must cover >= this fraction of the frame
 SHOW_MASK = True               # extra window showing the marker mask
 HSV_FILE  = "marker_hsv.json"
 if os.path.exists(HSV_FILE):
     _h = json.load(open(HSV_FILE))
     MARKER_LO, MARKER_HI = tuple(_h["lo"]), tuple(_h["hi"])
     MIN_MARKER_AREA = _h.get("min_area", MIN_MARKER_AREA)
+    print(f"marker HSV from {HSV_FILE}: lo={MARKER_LO} hi={MARKER_HI} min_area={MIN_MARKER_AREA}")
+else:
+    print(f"WARNING: no {HSV_FILE} - using default lo={MARKER_LO} hi={MARKER_HI}. "
+          "Run --tune and press s.")
 MIN_OBJ_AREA = 300
 SIG_FILE = "object_signatures.json"
 
@@ -74,9 +78,13 @@ SIG_FILE = "object_signatures.json"
 SECTIONS = [[2, 2, 1],
             [6, "H", 1],
             [3, 5, 4]]
-# Orientation comes from the camera image: the layout's top row (2, 1) is the
-# edge FURTHEST from the camera. FAR_SIDE says where that edge appears in the
-# image: "top", "bottom", "left" or "right". Check the --dry overlay.
+# Orientation:
+#  - With 3 markers: the corner WITHOUT a marker is MISSING_CORNER (BR = next
+#    to section 4). This is the normal setup.
+#  - With all 4 markers visible: fall back to FAR_SIDE = where the layout's top
+#    edge (sections 2/1) appears in the image: "top"/"right"/"bottom"/"left"
+#    or an angle in degrees (0 = up, 90 = right).
+MISSING_CORNER = "BR"
 FAR_SIDE = "top"
 
 
@@ -92,6 +100,7 @@ def marker_blobs(hsv):
         if a >= MIN_MARKER_AREA:
             m = cv2.moments(c); blobs.append((a, m["m10"] / m["m00"], m["m01"] / m["m00"]))
     blobs.sort(reverse=True)
+    marker_blobs.last = [(int(u), int(v), int(a)) for a, u, v in blobs]
     return np.array([[u, v] for _, u, v in blobs], np.float32)
 
 
@@ -107,6 +116,16 @@ def _largest_quad(pts):
         if a > best_a:
             best, best_a = p, a
     return best
+
+
+_last_diag = [0.0]
+def diag_print(corners):
+    """Once a second: what the marker detector sees (terminal)."""
+    if time.time() - _last_diag[0] < 1.0:
+        return
+    _last_diag[0] = time.time()
+    print(f"[diag] {corner_status()} | blobs (x,y,area): {getattr(marker_blobs, 'last', [])[:8]}"
+          + ("" if corners is None else f" | corners ok: {corners.astype(int).tolist()}"))
 
 
 def corner_status():
@@ -126,12 +145,14 @@ def tray_corners(hsv):
     tray_corners.last_n = len(pts)
     if len(pts) < 3:
         return None
+    missing = None
     if len(pts) >= 4:
         quad = _largest_quad(pts[:8])
     else:                                              # 3 markers: reconstruct
         d = [np.linalg.norm(pts[(i+1) % 3] - pts[(i+2) % 3]) for i in range(3)]
         mid = int(np.argmax(d))
-        quad = np.vstack([pts, (pts[(mid+1) % 3] + pts[(mid+2) % 3] - pts[mid])[None]])
+        missing = pts[(mid+1) % 3] + pts[(mid+2) % 3] - pts[mid]
+        quad = np.vstack([pts, missing[None]])
 
     # Reject degenerate quads (collinear noise blobs -> a "line").
     area = cv2.contourArea(cv2.convexHull(quad.astype(np.float32)))
@@ -139,17 +160,35 @@ def tray_corners(hsv):
         tray_corners.last_n = -len(pts)                # negative = degenerate
         return None
 
-    # Rotate image coords so that FAR_SIDE becomes "top", then sort.
-    x, y = quad[:, 0].copy(), quad[:, 1].copy()
-    if FAR_SIDE == "bottom":  x, y = -x, -y
-    elif FAR_SIDE == "left": x, y = -y,  x
-    elif FAR_SIDE == "right": x, y = y, -x
-    r = np.stack([x, y], 1)
-    tl = quad[np.argmin(r[:, 0] + r[:, 1])]
-    tr = quad[np.argmax(r[:, 0] - r[:, 1])]
-    br = quad[np.argmax(r[:, 0] + r[:, 1])]
-    bl = quad[np.argmin(r[:, 0] - r[:, 1])]
-    return np.array([tl, tr, br, bl], np.float32)
+    return order_corners(quad, missing)
+
+
+def order_corners(quad, missing=None):
+    """
+    Rotation-proof ordering. Sort the 4 corners clockwise around their centre,
+    then rotate the list so the FAR edge (sections 2/1) comes first:
+    result = [TL, TR, BR, BL] of the SECTIONS layout.
+    FAR_SIDE: "top"/"right"/"bottom"/"left", or an angle in degrees
+    (0 = up in the image, 90 = right, 180 = down, 270 = left).
+    """
+    quad = np.asarray(quad, np.float32)
+    ctr = quad.mean(axis=0)
+    ang = np.arctan2(quad[:, 1] - ctr[1], quad[:, 0] - ctr[0])
+    quad = quad[np.argsort(ang)]                       # clockwise (y is down)
+
+    # Preferred: the corner with NO marker is MISSING_CORNER of the layout.
+    if missing is not None:
+        k = int(np.argmin(np.linalg.norm(quad - missing, axis=1)))
+        want = ["TL", "TR", "BR", "BL"].index(MISSING_CORNER)
+        return np.roll(quad, want - k, axis=0)         # [TL, TR, BR, BL]
+
+    # Fallback (all 4 markers visible): far edge from FAR_SIDE.
+    deg = {"top": 0, "right": 90, "bottom": 180, "left": 270}.get(FAR_SIDE, FAR_SIDE)
+    t = np.deg2rad(float(deg))
+    far_dir = np.array([np.sin(t), -np.cos(t)])        # image vector toward far side
+    mids = (quad + np.roll(quad, -1, axis=0)) / 2      # edge i: quad[i] -> quad[i+1]
+    k = int(np.argmax((mids - ctr) @ far_dir))         # the far edge
+    return np.roll(quad, -k, axis=0)                   # [TL, TR, BR, BL]
 
 
 def _poly(H, rect):
@@ -255,6 +294,7 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
             continue
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         corners = tray_corners(hsv)
+        diag_print(corners)
         if corners is None:
             continue
         roi, poly = home_roi_mask(frame.shape, corners)
@@ -382,6 +422,7 @@ def calibrate_layout(cam, n_frames=8):
                 continue
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             corners = tray_corners(hsv)
+            diag_print(corners)
             if corners is None:
                 continue
             for spot, name in spot_to_obj.items():
