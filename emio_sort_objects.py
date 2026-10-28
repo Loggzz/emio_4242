@@ -29,7 +29,7 @@ Run (from the emio_4242 folder):
 import sys, json, os, time, math
 import numpy as np
 
-VERSION = "v13 (2026-10-28 14:28) int max_velocity"
+VERSION = "v14 (2026-10-28 14:33) reliable SPACE, 3 samples in both calibrate modes"
 print(f"emio_sort_objects {VERSION}  -  {os.path.abspath(__file__)}")
 import cv2
 from emioapi import EmioAPI
@@ -440,6 +440,15 @@ def grab(cam):
     return cam.frame
 
 
+def pop_key(extra_wait=30):
+    """Last key seen by look_at_home, or a fresh waitKey. 255 = none."""
+    k = getattr(look_at_home, "key", 255)
+    look_at_home.key = 255
+    if k == 255:
+        k = cv2.waitKey(extra_wait) & 0xFF
+    return k
+
+
 def look_at_home(cam, refs=None, show=True, n_frames=8):
     """Returns (name, dist, poly) or (None, None, poly). Averages several frames."""
     sigs, poly, frame, corners = [], None, None, None
@@ -485,7 +494,10 @@ def look_at_home(cam, refs=None, show=True, n_frames=8):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.putText(frame, reason, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        cv2.imshow("emio sort", frame); cv2.waitKey(1)
+        cv2.imshow("emio sort", frame)
+        k = cv2.waitKey(1) & 0xFF
+        if k != 255:
+            look_at_home.key = k                      # remember key for callers
     return (name, dist, np.mean(sigs, axis=0) if sigs else None)
 
 
@@ -582,16 +594,20 @@ def calibrate_one_by_one(cam):
           "(nudge/rotate it a little between presses). q = quit.")
     for name in OBJECTS:
         refs[name] = []
+        print(f"\n== {name.upper()} : put it in HOME, press SPACE "
+              f"{SAMPLES_PER_OBJECT} times (nudge it between presses) ==")
         while len(refs[name]) < SAMPLES_PER_OBJECT:
-            k = len(refs[name]) + 1
-            print(f"\r{name.upper()} in HOME -> SPACE  ({k}/{SAMPLES_PER_OBJECT})   ", end="")
             _, _, sig = look_at_home(cam)
-            key = cv2.waitKey(50) & 0xFF
+            key = pop_key()
             if key == ord("q"):
-                return
-            if key == 32 and sig is not None:
-                refs[name].append(sig.tolist()); time.sleep(0.3)
-        print(f"\r{name.upper()} saved ({SAMPLES_PER_OBJECT} samples)        ")
+                print("quit - nothing saved"); return
+            if key == 32:
+                if sig is None:
+                    print("   no object seen in HOME - not saved"); continue
+                refs[name].append(sig.tolist())
+                print(f"   sample {len(refs[name])}/{SAMPLES_PER_OBJECT} saved")
+                time.sleep(0.4)
+        print(f"   {name.upper()} done")
     json.dump(refs, open(SIG_FILE, "w"), indent=1)
     print("Saved", SIG_FILE)
 
@@ -599,7 +615,9 @@ def calibrate_one_by_one(cam):
 def calibrate_layout(cam, n_frames=8):
     """All objects in their final spots at once; one signature per section."""
     spot_to_obj = {v: k for k, v in OBJECT_TO_SPOT.items()}
-    print("Put every object in its assigned spot, HOME empty. SPACE to save, q to quit.")
+    print(f"Put every object in its assigned spot, HOME empty. Press SPACE "
+          f"{SAMPLES_PER_OBJECT} times (nudge objects between presses). q = quit.")
+    collected = {n: [] for n in OBJECTS}
     while True:
         sigs = {name: [] for name in OBJECTS}
         frame = corners = None
@@ -633,17 +651,23 @@ def calibrate_layout(cam, n_frames=8):
             if corners is None:
                 msg = "no tray - " + corner_status()
             else:
-                msg = "SPACE = save" if not missing else "missing: " + ", ".join(missing)
+                done = len(next(iter(collected.values())))
+            msg = (f"SPACE = sample {done + 1}/{SAMPLES_PER_OBJECT}" if not missing
+                   else "missing: " + ", ".join(missing))
             cv2.putText(frame, msg, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             cv2.imshow("emio sort", frame)
         key = cv2.waitKey(50) & 0xFF
         if key == ord("q"):
-            return
+            print("quit - nothing saved"); return
         if key == 32 and not missing:
-            json.dump({n: s.tolist() for n, s in found.items()}, open(SIG_FILE, "w"), indent=1)
-            for n, s in found.items():
-                print(f"  {n:10s} {np.round(s, 2).tolist()}")
-            print("Saved", SIG_FILE); return
+            for n, sg in found.items():
+                collected[n].append(sg.tolist())
+            done = len(collected[OBJECTS[0]])
+            print(f"   sample {done}/{SAMPLES_PER_OBJECT} saved for all objects")
+            time.sleep(0.4)
+            if done >= SAMPLES_PER_OBJECT:
+                json.dump(collected, open(SIG_FILE, "w"), indent=1)
+                print("Saved", SIG_FILE); return
 
 
 def main():
