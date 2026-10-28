@@ -86,6 +86,9 @@ SECTIONS = [[2, 2, 1],
 #    or an angle in degrees (0 = up, 90 = right).
 MISSING_CORNER = "BR"
 FAR_SIDE = "top"
+# Final correction: number of 90-degree CLOCKWISE turns to apply to the grid
+# overlay (0-3). Use this if the numbers are drawn rotated on the tray.
+GRID_ROTATE_CW = 1
 
 
 def marker_blobs(hsv):
@@ -160,7 +163,8 @@ def tray_corners(hsv):
         tray_corners.last_n = -len(pts)                # negative = degenerate
         return None
 
-    return order_corners(quad, missing)
+    ordered = order_corners(quad, missing)
+    return np.roll(ordered, -GRID_ROTATE_CW, axis=0)   # rotate grid CW
 
 
 def order_corners(quad, missing=None):
