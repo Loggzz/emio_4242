@@ -118,6 +118,7 @@ else:
 MIN_OBJ_AREA = 300
 DARK_V = 70                    # pixels darker than this count as object (black)
 SIG_FILE = "object_signatures.json"
+SAMPLES_PER_OBJECT = 3         # --calibrate-one: samples recorded per object
 
 
 # ---------- tray geometry ----------
@@ -332,14 +333,36 @@ def home_roi_mask(shape, corners):
 
 
 # ---------- object detection + signature ----------
-def object_in_home(hsv, roi_mask):
-    """Largest coloured (non-white, non-blue-tape) blob inside HOME."""
+USE_DEPTH    = True            # also segment by height above the tray
+DEPTH_OBJ_MM = 6               # pixels this much closer than the tray = object
+
+
+def depth_object_mask(depth, roi_mask, shape):
+    """Pixels inside ROI that are raised above the tray surface (by depth)."""
+    if depth is None:
+        return None
+    d = depth.astype(np.float32)
+    if d.shape[:2] != shape[:2]:
+        d = cv2.resize(d, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    roi = (roi_mask > 0) & (d > 0)
+    if roi.sum() < 50:
+        return None
+    tray = np.percentile(d[roi], 75)                 # tray surface = far majority
+    return (roi & (d < tray - DEPTH_OBJ_MM)).astype(np.uint8) * 255
+
+
+def object_in_home(hsv, roi_mask, depth=None):
+    """Largest object blob inside HOME: colour OR dark OR raised (depth)."""
     h, s, v = cv2.split(hsv)
     coloured = (s > 70) & (v > 60)
     dark = v < DARK_V                       # black objects (nori / maki)
     blue_tape = (h > 95) & (h < 125) & (s > 70)
     mask = ((coloured | dark) & ~blue_tape).astype(np.uint8) * 255
     mask = cv2.bitwise_and(mask, roi_mask)
+    if USE_DEPTH:
+        dm = depth_object_mask(depth, roi_mask, hsv.shape)
+        if dm is not None:
+            mask = cv2.bitwise_or(mask, dm)      # white rice etc. now included
     k = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
@@ -354,8 +377,8 @@ def object_in_home(hsv, roi_mask):
 
 
 HUE_BINS = 18
-# Feature weights: [hue histogram, mean sat, dark fraction, solidity, rectangularity, aspect]
-FEAT_W = np.array([4.0] * HUE_BINS + [1.0, 2.0, 1.5, 0.7, 0.5])
+# Feature weights: [hue hist, mean sat, dark frac, white frac, solidity, rect, aspect]
+FEAT_W = np.array([4.0] * HUE_BINS + [2.0, 2.0, 2.5, 1.5, 0.7, 0.5])
 
 
 def signature(hsv, cnt, mask):
@@ -368,7 +391,8 @@ def signature(hsv, cnt, mask):
       - aspect ratio of min-area-rect (eggplant -> elongated)
     """
     px = hsv[mask > 0]
-    dark_frac = (px[:, 2] < DARK_V).mean()
+    dark_frac  = (px[:, 2] < DARK_V).mean()
+    white_frac = ((px[:, 1] < 60) & (px[:, 2] > 150)).mean()   # rice / bun top
     sat_sel = (px[:, 1] > 60) & (px[:, 2] >= DARK_V)
     if sat_sel.sum() > 0.1 * len(px):
         hist, _ = np.histogram(px[sat_sel, 0], bins=HUE_BINS, range=(0, 180))
@@ -384,17 +408,27 @@ def signature(hsv, cnt, mask):
     (w, h) = cv2.minAreaRect(cnt)[1]
     rect = area / max(1, w * h)
     aspect = min(w, h) / max(1, max(w, h))
-    return np.concatenate([hist, [sat, dark_frac, solidity, rect, aspect]])
+    return np.concatenate([hist, [sat, dark_frac, white_frac, solidity, rect, aspect]])
+
+
+def _samples(v):
+    a = np.array(v, float)
+    return a[None] if a.ndim == 1 else a
 
 
 def classify(sig, refs):
-    """Weighted nearest neighbour. Returns (name, dist, runner_up, dist2)."""
-    names = list(refs); M = np.array([refs[n] for n in names])
-    d = np.linalg.norm((M - sig) * FEAT_W, axis=1)
-    order = np.argsort(d)
+    """Weighted nearest neighbour over every stored sample of every object."""
+    best = {}
+    for n, v in refs.items():
+        S = _samples(v)
+        if S.shape[1] != len(sig):
+            raise SystemExit("object_signatures.json is from an older version - "
+                             "run --calibrate-one again")
+        best[n] = float(np.linalg.norm((S - sig) * FEAT_W, axis=1).min())
+    order = sorted(best, key=best.get)
     i, j = order[0], (order[1] if len(order) > 1 else order[0])
-    classify.runner_up = (names[j], float(d[j]))
-    return names[i], float(d[i])
+    classify.runner_up = (j, best[j])
+    return i, best[i]
 
 
 # ---------- camera helpers ----------
@@ -418,7 +452,7 @@ def look_at_home(cam, refs=None, show=True, n_frames=8):
             continue
         tray_seen += 1
         roi, poly = home_roi_mask(frame.shape, corners)
-        cnt, m = object_in_home(hsv, roi)
+        cnt, m = object_in_home(hsv, roi, cam.depth_frame if USE_DEPTH else None)
         best_area = max(best_area, getattr(object_in_home, "best_area", 0))
         if cnt is not None:
             sigs.append(signature(hsv, cnt, m))
@@ -541,13 +575,20 @@ def tune_markers(cam):
 
 def calibrate_one_by_one(cam):
     refs = {}
-    print("Place each object in HOME, then press the key shown. q = quit.")
+    print(f"Each object: place in HOME, press SPACE {SAMPLES_PER_OBJECT}x "
+          "(nudge/rotate it a little between presses). q = quit.")
     for name in OBJECTS:
-        print(f"\nPlace {name.upper()} in HOME and press SPACE")
-        while True:
+        refs[name] = []
+        while len(refs[name]) < SAMPLES_PER_OBJECT:
+            k = len(refs[name]) + 1
+            print(f"\r{name.upper()} in HOME -> SPACE  ({k}/{SAMPLES_PER_OBJECT})   ", end="")
             _, _, sig = look_at_home(cam)
-            if cv2.waitKey(50) & 0xFF == 32 and sig is not None:
-                refs[name] = sig.tolist(); print("  saved", np.round(sig, 2)); break
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord("q"):
+                return
+            if key == 32 and sig is not None:
+                refs[name].append(sig.tolist()); time.sleep(0.3)
+        print(f"\r{name.upper()} saved ({SAMPLES_PER_OBJECT} samples)        ")
     json.dump(refs, open(SIG_FILE, "w"), indent=1)
     print("Saved", SIG_FILE)
 
@@ -570,7 +611,7 @@ def calibrate_layout(cam, n_frames=8):
                 continue
             for spot, name in spot_to_obj.items():
                 roi, _ = region_mask(frame.shape, corners, spot)
-                cnt, m = object_in_home(hsv, roi)
+                cnt, m = object_in_home(hsv, roi, cam.depth_frame if USE_DEPTH else None)
                 if cnt is not None:
                     sigs[name].append(signature(hsv, cnt, m))
             time.sleep(0.05)
@@ -636,8 +677,8 @@ def main():
 
         placed = set()
         first = True
-        print("Waiting for objects in HOME. Press q in the window (or Ctrl-C) to end.")
-        while len(placed) < len(OBJECTS):
+        print("Waiting for objects in HOME. Runs until you press q in the window (or Ctrl-C).")
+        while True:
             if not first and AFTER_PLACE_LOOK is not None:
                 go(emio, AFTER_PLACE_LOOK, POSE_BY_NAME[AFTER_PLACE_LOOK], dry=False)
             first = False
@@ -656,8 +697,7 @@ def main():
             ru = getattr(classify, "runner_up", ("?", 0))
             print(f"Detected {name} (d={dist:.2f}; next: {ru[0]} d={ru[1]:.2f}) -> spot {spot}")
             if spot in placed:
-                print(f"  spot {spot} already filled - remove the object, waiting...")
-                time.sleep(2); continue
+                print(f"  note: spot {spot} was already used - placing there again")
             # require the same answer twice so a hand/shadow mid-placement isn't picked
             name2, _, _ = look_at_home(emio.camera, refs)
             if name2 != name:
@@ -667,8 +707,7 @@ def main():
                 placed.add(spot); continue
             pick_and_place(emio, spot, dry)
             placed.add(spot)
-            print(f"  done {len(placed)}/{len(OBJECTS)}: {sorted(placed)}")
-        print("All objects placed.")
+            print(f"  placed so far: {sorted(placed)}")
     except KeyboardInterrupt:
         pass
     finally:
