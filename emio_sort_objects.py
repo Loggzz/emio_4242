@@ -75,7 +75,9 @@ print(f"  {len(POSE_SEQUENCE)} poses, spots {sorted(SEGMENTS)}, hover = {dict(PO
 POSE_BY_NAME = {n: a for n, a in POSE_SEQUENCE}
 # Pose (name from movej.py) the robot goes to for the FIRST look (and for
 # tune/calibrate/dry) so the gripper is out of the camera's way.
-LOOK_POSE = "home"
+LOOK_POSE = "hover"
+# Pose to hold when the script ends (every mode). None = stay where it is.
+END_POSE = "hover"
 # After each pick-and-place: None = stay where the segment ended
 # (poseN_open_hover, gripper off to the side) and look from there;
 # or a pose name from movej.py to move to before looking.
@@ -647,7 +649,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)
+        if END_POSE is not None:
+            go(emio, END_POSE, POSE_BY_NAME[END_POSE], dry=False)
         emio.camera.close(); emio.disconnect(); cv2.destroyAllWindows()
 
 
