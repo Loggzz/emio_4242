@@ -28,6 +28,9 @@ Run (from the emio_4242 folder):
 
 import sys, json, os, time, math
 import numpy as np
+
+VERSION = "v13 (2026-10-28 14:28) int max_velocity"
+print(f"emio_sort_objects {VERSION}  -  {os.path.abspath(__file__)}")
 import cv2
 from emioapi import EmioAPI
 
@@ -41,12 +44,12 @@ from movej import POSE_SEQUENCE, move_j
 def _velocity_from_movej():
     """movej.MAX_VELOCITY if defined, else the max_velocity line in movej.main()."""
     if hasattr(movej, "MAX_VELOCITY"):
-        return list(movej.MAX_VELOCITY)
+        return [int(round(float(x))) for x in movej.MAX_VELOCITY]
     import re
     src = open(movej.__file__).read()
     m = re.search(r"max_velocity\s*=\s*\[([^\]]+)\]", src)
     if m:
-        return [float(x) for x in m.group(1).split(",")]
+        return [int(round(float(x))) for x in m.group(1).split(",")]
     return [25, 25, 25, 25]
 
 MAX_VELOCITY = _velocity_from_movej()
@@ -660,7 +663,10 @@ def main():
         grab(emio.camera); time.sleep(0.05)
 
     try:
-        emio.motors.max_velocity = MAX_VELOCITY
+        try:
+            emio.motors.max_velocity = [int(v) for v in MAX_VELOCITY]
+        except Exception as e:                      # keep going with motor defaults
+            print(f"WARNING: could not set max_velocity={MAX_VELOCITY}: {e}")
         print(f"Moving to LOOK_POSE '{LOOK_POSE}' so the camera has a clear view.")
         go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)  # always, even in --dry
         if do_view:
