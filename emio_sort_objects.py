@@ -7,7 +7,7 @@ Objects (from the photos) -> spot numbers (edit OBJECT_TO_SPOT if different):
     bread     -> 3        tomato   -> 5
 
 Pipeline per object
-  1. Camera looks at the HOME square (centre of the tray, found from the 4 green corners).
+  1. Camera looks at the HOME square (centre of the tray, found from the 4 orange corners).
   2. The object there is classified by colour/shape (nearest neighbour against
      a reference set you record once with --calibrate).
   3. The pick-and-place motor sequence for that spot is executed.
@@ -52,10 +52,10 @@ OBJECT_TO_SPOT = {"cheese": 2, "eggplant": 1, "burger": 6,
                   "donut": 4, "bread": 3, "tomato": 5}
 OBJECTS = list(OBJECT_TO_SPOT)
 
-# Corner MARKERS are GREEN. OpenCV HSV: H 0-180, S 0-255, V 0-255.
+# Corner MARKERS are ORANGE. OpenCV HSV: H 0-180, S 0-255, V 0-255.
 # Run  --tune  to set these with sliders; the result is saved to marker_hsv.json
 # and loaded automatically on later runs (overrides the values below).
-MARKER_LO, MARKER_HI = (35, 50, 40), (90, 255, 255)
+MARKER_LO, MARKER_HI = (5, 100, 100), (22, 255, 255)
 MIN_MARKER_AREA = 25
 MIN_TRAY_FRAC   = 0.03         # tray must cover >= this fraction of the frame
 SHOW_MASK = True               # extra window showing the marker mask
@@ -96,7 +96,7 @@ def marker_blobs(hsv):
 
 
 def _largest_quad(pts):
-    """Pick the 4 blobs spanning the largest area (ignores stray green)."""
+    """Pick the 4 blobs spanning the largest area (ignores stray marker-coloured blobs)."""
     from itertools import combinations
     if len(pts) == 4:
         return pts
@@ -119,7 +119,7 @@ def corner_status():
 def tray_corners(hsv):
     """
     Returns the 4 tray corners in image coords, ordered [TL, TR, BR, BL]
-    of the SECTIONS layout. Uses 4 green markers; falls back to 3 by
+    of the SECTIONS layout. Uses 4 orange markers; falls back to 3 by
     reconstructing the 4th. Orientation: FAR_SIDE of the image = layout top.
     """
     pts = marker_blobs(hsv)
