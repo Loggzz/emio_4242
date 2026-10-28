@@ -122,11 +122,16 @@ FAR_SIDE = "top"
 GRID_ROTATE_CW = 1
 
 
-def marker_blobs(hsv):
-    mask = cv2.inRange(hsv, np.array(MARKER_LO), np.array(MARKER_HI))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    if SHOW_MASK:
-        cv2.imshow("marker mask", mask)
+RELAX_LEVELS = (1.0, 0.7, 0.5, 0.3)   # S/V lower bounds scaled by these, in turn
+
+
+def _marker_mask(hsv, relax):
+    lo = (MARKER_LO[0], int(MARKER_LO[1] * relax), int(MARKER_LO[2] * relax))
+    mask = cv2.inRange(hsv, np.array(lo), np.array(MARKER_HI))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+def _blobs_of(mask):
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blobs = []
     for c in cnts:
@@ -134,8 +139,29 @@ def marker_blobs(hsv):
         if a >= MIN_MARKER_AREA:
             m = cv2.moments(c); blobs.append((a, m["m10"] / m["m00"], m["m01"] / m["m00"]))
     blobs.sort(reverse=True)
-    marker_blobs.last = [(int(u), int(v), int(a)) for a, u, v in blobs]
-    return np.array([[u, v] for _, u, v in blobs], np.float32)
+    return blobs
+
+
+def marker_blobs(hsv):
+    """
+    Marker detection that tolerates exposure drift: start from the tuned HSV
+    range; if fewer than 3 (or more than 8) blobs, relax the S/V lower bounds
+    step by step and take the first level that gives a sensible count.
+    """
+    best, best_mask, best_lvl = [], None, RELAX_LEVELS[0]
+    for lvl in RELAX_LEVELS:
+        mask = _marker_mask(hsv, lvl)
+        blobs = _blobs_of(mask)
+        if 3 <= len(blobs) <= 8:
+            best, best_mask, best_lvl = blobs, mask, lvl
+            break
+        if best_mask is None or abs(len(blobs) - 3.5) < abs(len(best) - 3.5):
+            best, best_mask, best_lvl = blobs, mask, lvl
+    marker_blobs.level = best_lvl
+    if SHOW_MASK:
+        cv2.imshow("marker mask", best_mask)
+    marker_blobs.last = [(int(u), int(v), int(a)) for a, u, v in best]
+    return np.array([[u, v] for _, u, v in best], np.float32)
 
 
 def _largest_quad(pts):
@@ -164,8 +190,10 @@ def diag_print(corners):
 
 def corner_status():
     n = getattr(tray_corners, "last_n", 0)
+    lvl = getattr(marker_blobs, "level", 1.0)
+    tag = "" if lvl == 1.0 else f" relax={lvl}"
     if n == 99: return "markers: (cached)"
-    if n >= 3:  return f"markers: {n}"
+    if n >= 3:  return f"markers: {n}{tag}"
     if n < 0:   return f"markers: {-n} but collinear/too small"
     return f"markers: {n} (need 3)"
 
@@ -430,6 +458,22 @@ def refs_if_any():
     return json.load(open(SIG_FILE)) if os.path.exists(SIG_FILE) else None
 
 
+LOOK_TIMEOUT_S = 10.0
+
+
+def look_with_retry(cam, refs):
+    """Keep looking until an object is classified, HOME is confirmed empty
+    (tray seen), or LOOK_TIMEOUT_S passes. Shows the live window meanwhile."""
+    t0 = time.time()
+    while True:
+        name, dist, sig = look_at_home(cam, refs)
+        if name is not None or "HOME empty" in look_at_home.reason:
+            return name, dist, sig
+        if time.time() - t0 > LOOK_TIMEOUT_S:
+            return name, dist, sig
+        cv2.waitKey(30)
+
+
 def view(cam, refs=None):
     """Live detection view, no robot motion. q to quit."""
     print("Live view. q to quit.")
@@ -554,6 +598,8 @@ def main():
     emio.camera.track_markers = False
     if not emio.camera.open():
         print("Camera failed"); emio.disconnect(); return
+    for _ in range(20):                      # let auto-exposure settle
+        grab(emio.camera); time.sleep(0.05)
 
     try:
         emio.motors.max_velocity = MAX_VELOCITY
@@ -575,7 +621,7 @@ def main():
         for i in range(len(OBJECTS)):
             if i > 0:
                 go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)
-            name, dist, _ = look_at_home(emio.camera, refs)
+            name, dist, _ = look_with_retry(emio.camera, refs)
             if name is None:
                 print("Stopping:", look_at_home.reason)
                 if "NO TRAY" in look_at_home.reason:
