@@ -62,7 +62,10 @@ SIG_FILE = "object_signatures.json"
 SECTIONS = [[2, 2, 1],
             [6, "H", 1],
             [3, 5, 4]]
-MISSING_CORNER = "BR"          # missing green marker is next to section 4
+# Orientation comes from the camera image: the layout's top row (2, 1) is the
+# edge FURTHEST from the camera. FAR_SIDE says where that edge appears in the
+# image: "top", "bottom", "left" or "right". Check the --dry overlay.
+FAR_SIDE = "top"
 
 
 def green_blobs(hsv):
@@ -78,34 +81,47 @@ def green_blobs(hsv):
     return np.array([[u, v] for _, u, v in blobs], np.float32)
 
 
+def _largest_quad(pts):
+    """Pick the 4 blobs spanning the largest area (ignores stray green)."""
+    from itertools import combinations
+    if len(pts) == 4:
+        return pts
+    best, best_a = None, -1
+    for q in combinations(range(len(pts)), 4):
+        p = pts[list(q)]
+        a = cv2.contourArea(cv2.convexHull(p.astype(np.float32)))
+        if a > best_a:
+            best, best_a = p, a
+    return best
+
+
 def tray_corners(hsv):
     """
-    Returns 4 image corners ordered [TL, TR, BR, BL] in the tray's layout frame,
-    reconstructing the missing corner from the 3 visible green markers.
+    Returns the 4 tray corners in image coords, ordered [TL, TR, BR, BL]
+    of the SECTIONS layout. Uses 4 green markers; falls back to 3 by
+    reconstructing the 4th. Orientation: FAR_SIDE of the image = layout top.
     """
     pts = green_blobs(hsv)
     if len(pts) < 3:
         return None
-    pts = pts[:3]
-    # middle corner = the one whose two neighbours are farthest apart (diagonal)
-    d = [np.linalg.norm(pts[(i+1) % 3] - pts[(i+2) % 3]) for i in range(3)]
-    mid = int(np.argmax(d))
-    a, c = pts[(mid+1) % 3], pts[(mid+2) % 3]
-    missing = a + c - pts[mid]
-    quad = np.vstack([pts, missing[None]])            # 4 corners, last = missing
+    if len(pts) >= 4:
+        quad = _largest_quad(pts[:8])
+    else:                                              # 3 markers: reconstruct
+        d = [np.linalg.norm(pts[(i+1) % 3] - pts[(i+2) % 3]) for i in range(3)]
+        mid = int(np.argmax(d))
+        quad = np.vstack([pts, (pts[(mid+1) % 3] + pts[(mid+2) % 3] - pts[mid])[None]])
 
-    # order clockwise in the image (camera looks down, so image CW = tray CW)
-    ctr = quad.mean(axis=0)
-    order = np.argsort(np.arctan2(quad[:, 1] - ctr[1], quad[:, 0] - ctr[0]))
-    quad = quad[order]                                 # CW with y-down image coords
-    k = int(np.where(order == 3)[0][0])                # index of missing corner
-    quad = np.roll(quad, -k, axis=0)                   # missing corner first
-
-    # layout corners CW starting from TL: TL, TR, BR, BL
-    cw = ["TL", "TR", "BR", "BL"]
-    shift = cw.index(MISSING_CORNER)
-    ordered = np.roll(quad, shift, axis=0)             # now [TL, TR, BR, BL]
-    return ordered.astype(np.float32)
+    # Rotate image coords so that FAR_SIDE becomes "top", then sort.
+    x, y = quad[:, 0].copy(), quad[:, 1].copy()
+    if FAR_SIDE == "bottom":  x, y = -x, -y
+    elif FAR_SIDE == "left": x, y = -y,  x
+    elif FAR_SIDE == "right": x, y = y, -x
+    r = np.stack([x, y], 1)
+    tl = quad[np.argmin(r[:, 0] + r[:, 1])]
+    tr = quad[np.argmax(r[:, 0] - r[:, 1])]
+    br = quad[np.argmax(r[:, 0] + r[:, 1])]
+    bl = quad[np.argmin(r[:, 0] - r[:, 1])]
+    return np.array([tl, tr, br, bl], np.float32)
 
 
 def _poly(H, rect):
@@ -227,8 +243,10 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
                 cv2.polylines(frame, [p], True, (255, 0, 0), 1)
                 cv2.putText(frame, str(num), tuple(p.mean(axis=0).astype(int)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            miss_idx = ["TL", "TR", "BR", "BL"].index(MISSING_CORNER)
-            cv2.circle(frame, tuple(corners[miss_idx].astype(int)), 8, (0, 0, 255), 2)
+            for lab, c in zip(("TL", "TR", "BR", "BL"), corners):
+                cv2.circle(frame, tuple(c.astype(int)), 8, (0, 0, 255), 2)
+                cv2.putText(frame, lab, tuple(c.astype(int) + [10, -10]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         if poly is not None:
             cv2.polylines(frame, [poly], True, (0, 255, 0), 2)
         cv2.putText(frame, f"{name or 'empty'}", (10, 30),
