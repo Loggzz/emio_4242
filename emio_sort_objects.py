@@ -2,9 +2,9 @@
 Emio: sort 6 play-dough objects from the tray's HOME square to their numbered spots.
 
 Objects (from the photos) -> spot numbers (edit OBJECT_TO_SPOT if different):
-    cheese    -> 2        eggplant -> 1
+    durian    -> 2        sushi    -> 1
     burger    -> 6        donut    -> 4
-    bread     -> 3        tomato   -> 5
+    maki      -> 3        tomato   -> 5
 
 Pipeline per object
   1. Camera looks at the HOME square (centre of the tray, found from the 4 purple corners).
@@ -78,8 +78,8 @@ LOOK_POSE = "home"
 HOVER_POSE = next(a for n, a in POSE_SEQUENCE if n == "hover")
 # =========================================================================
 
-OBJECT_TO_SPOT = {"cheese": 2, "eggplant": 1, "burger": 6,
-                  "donut": 4, "bread": 3, "tomato": 5}
+OBJECT_TO_SPOT = {"durian": 2, "sushi": 1, "burger": 6,
+                  "donut": 4, "maki": 3, "tomato": 5}
 OBJECTS = list(OBJECT_TO_SPOT)
 
 # Corner MARKERS are PURPLE. OpenCV HSV: H 0-180, S 0-255, V 0-255.
@@ -99,6 +99,7 @@ else:
     print(f"WARNING: no {HSV_FILE} - using default lo={MARKER_LO} hi={MARKER_HI}. "
           "Run --tune and press s.")
 MIN_OBJ_AREA = 300
+DARK_V = 70                    # pixels darker than this count as object (black)
 SIG_FILE = "object_signatures.json"
 
 
@@ -163,6 +164,7 @@ def diag_print(corners):
 
 def corner_status():
     n = getattr(tray_corners, "last_n", 0)
+    if n == 99: return "markers: (cached)"
     if n >= 3:  return f"markers: {n}"
     if n < 0:   return f"markers: {-n} but collinear/too small"
     return f"markers: {n} (need 3)"
@@ -225,6 +227,19 @@ def order_corners(quad, missing=None):
     return np.roll(quad, -k, axis=0)                   # [TL, TR, BR, BL]
 
 
+CORNER_HOLD_S = 3.0            # reuse last good corners for this long if lost
+_corner_cache = {"c": None, "t": 0.0}
+def tray_corners_cached(hsv):
+    c = tray_corners(hsv)
+    if c is not None:
+        _corner_cache["c"], _corner_cache["t"] = c, time.time()
+        return c
+    if _corner_cache["c"] is not None and time.time() - _corner_cache["t"] < CORNER_HOLD_S:
+        tray_corners.last_n = 99                        # flag: cached
+        return _corner_cache["c"]
+    return None
+
+
 def _poly(H, rect):
     """rect = (x0, y0, x1, y1) in tray unit coords -> image polygon."""
     x0, y0, x1, y1 = rect
@@ -276,8 +291,9 @@ def object_in_home(hsv, roi_mask):
     """Largest coloured (non-white, non-blue-tape) blob inside HOME."""
     h, s, v = cv2.split(hsv)
     coloured = (s > 70) & (v > 60)
-    blue_tape = (h > 95) & (h < 125)
-    mask = (coloured & ~blue_tape).astype(np.uint8) * 255
+    dark = v < DARK_V                       # black objects (nori / maki)
+    blue_tape = (h > 95) & (h < 125) & (s > 70)
+    mask = ((coloured | dark) & ~blue_tape).astype(np.uint8) * 255
     mask = cv2.bitwise_and(mask, roi_mask)
     k = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -292,25 +308,47 @@ def object_in_home(hsv, roi_mask):
     return c, m
 
 
+HUE_BINS = 18
+# Feature weights: [hue histogram, mean sat, dark fraction, solidity, rectangularity, aspect]
+FEAT_W = np.array([4.0] * HUE_BINS + [1.0, 2.0, 1.5, 0.7, 0.5])
+
+
 def signature(hsv, cnt, mask):
-    """Feature vector: hue (cos,sin), sat, val, green fraction, rectangularity."""
+    """
+    Lighting-tolerant descriptor:
+      - hue histogram (12 bins, only reasonably saturated pixels)
+      - mean saturation, fraction of dark pixels (black maki -> high)
+      - solidity  = area / convex-hull area   (donut ring -> low)
+      - rectangularity = area / min-area-rect (bread -> high, tomato -> ~0.78)
+      - aspect ratio of min-area-rect (eggplant -> elongated)
+    """
     px = hsv[mask > 0]
-    hue = px[:, 0].astype(float) * 2 * np.pi / 180
-    green = ((px[:, 0] > 40) & (px[:, 0] < 85)).mean()
-    non_green = px[(px[:, 0] <= 40) | (px[:, 0] >= 85)]
-    if len(non_green):
-        hue = non_green[:, 0].astype(float) * 2 * np.pi / 180
-        sat, val = non_green[:, 1].mean() / 255, non_green[:, 2].mean() / 255
+    dark_frac = (px[:, 2] < DARK_V).mean()
+    sat_sel = (px[:, 1] > 60) & (px[:, 2] >= DARK_V)
+    if sat_sel.sum() > 0.1 * len(px):
+        hist, _ = np.histogram(px[sat_sel, 0], bins=HUE_BINS, range=(0, 180))
+        hist = hist.astype(float)
+        hist = hist + 0.5 * (np.roll(hist, 1) + np.roll(hist, -1))   # soft bins
+        hist = hist / max(1e-6, hist.sum())
     else:
-        sat, val = px[:, 1].mean() / 255, px[:, 2].mean() / 255
-    rect = cv2.contourArea(cnt) / max(1, np.prod(cv2.minAreaRect(cnt)[1]))
-    return np.array([np.cos(hue).mean(), np.sin(hue).mean(), sat, val, green, rect])
+        hist = np.full(HUE_BINS, 1.0 / HUE_BINS)   # colourless object: flat
+    sat = px[:, 1].mean() / 255
+    area = cv2.contourArea(cnt)
+    hull = cv2.contourArea(cv2.convexHull(cnt))
+    solidity = area / max(1, hull)
+    (w, h) = cv2.minAreaRect(cnt)[1]
+    rect = area / max(1, w * h)
+    aspect = min(w, h) / max(1, max(w, h))
+    return np.concatenate([hist, [sat, dark_frac, solidity, rect, aspect]])
 
 
 def classify(sig, refs):
+    """Weighted nearest neighbour. Returns (name, dist, runner_up, dist2)."""
     names = list(refs); M = np.array([refs[n] for n in names])
-    d = np.linalg.norm(M - sig, axis=1)
-    i = int(np.argmin(d))
+    d = np.linalg.norm((M - sig) * FEAT_W, axis=1)
+    order = np.argsort(d)
+    i, j = order[0], (order[1] if len(order) > 1 else order[0])
+    classify.runner_up = (names[j], float(d[j]))
     return names[i], float(d[i])
 
 
@@ -320,7 +358,7 @@ def grab(cam):
     return cam.frame
 
 
-def look_at_home(cam, refs=None, show=True, n_frames=5):
+def look_at_home(cam, refs=None, show=True, n_frames=8):
     """Returns (name, dist, poly) or (None, None, poly). Averages several frames."""
     sigs, poly, frame, corners = [], None, None, None
     tray_seen, best_area = 0, 0
@@ -329,7 +367,7 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
         if frame is None:
             continue
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        corners = tray_corners(hsv)
+        corners = tray_corners_cached(hsv)
         diag_print(corners)
         if corners is None:
             continue
@@ -465,7 +503,7 @@ def calibrate_layout(cam, n_frames=8):
             if frame is None:
                 continue
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            corners = tray_corners(hsv)
+            corners = tray_corners_cached(hsv)
             diag_print(corners)
             if corners is None:
                 continue
@@ -545,7 +583,8 @@ def main():
                           "Set LOOK_POSE to a pose in movej.py where the tray is visible.")
                 break
             spot = OBJECT_TO_SPOT[name]
-            print(f"Detected {name} (d={dist:.2f}) -> spot {spot}")
+            ru = getattr(classify, "runner_up", ("?", 0))
+            print(f"Detected {name} (d={dist:.2f}; next: {ru[0]} d={ru[1]:.2f}) -> spot {spot}")
             if spot in placed:
                 print(f"  spot {spot} already filled — check classification"); break
             if dry:
