@@ -69,11 +69,17 @@ def _split_segments(seq):
 
 
 HOME_POSE, SEGMENTS = _split_segments(POSE_SEQUENCE)
+print(f"movej.py loaded from: {movej.__file__}  (modified "
+      f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(movej.__file__)))})")
+print(f"  {len(POSE_SEQUENCE)} poses, spots {sorted(SEGMENTS)}, hover = {dict(POSE_SEQUENCE).get('hover', '?')}")
 POSE_BY_NAME = {n: a for n, a in POSE_SEQUENCE}
-# Pose (name from movej.py) the robot goes to before EVERY look at the tray
-# (tune, calibrate, dry, run) so the camera view is always the same and the
-# gripper is out of the way. Pick one where the markers are clearly visible.
+# Pose (name from movej.py) the robot goes to for the FIRST look (and for
+# tune/calibrate/dry) so the gripper is out of the camera's way.
 LOOK_POSE = "home"
+# After each pick-and-place: None = stay where the segment ended
+# (poseN_open_hover, gripper off to the side) and look from there;
+# or a pose name from movej.py to move to before looking.
+AFTER_PLACE_LOOK = None
 # After a segment, go back to 'hover' so the camera has a clear view of HOME.
 HOVER_POSE = next(a for n, a in POSE_SEQUENCE if n == "hover")
 # =========================================================================
@@ -619,8 +625,8 @@ def main():
 
         placed = set()
         for i in range(len(OBJECTS)):
-            if i > 0:
-                go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)
+            if i > 0 and AFTER_PLACE_LOOK is not None:
+                go(emio, AFTER_PLACE_LOOK, POSE_BY_NAME[AFTER_PLACE_LOOK], dry=False)
             name, dist, _ = look_with_retry(emio.camera, refs)
             if name is None:
                 print("Stopping:", look_at_home.reason)
