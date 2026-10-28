@@ -18,10 +18,11 @@ one segment per spot (each 'hover' ... up to the next 'hover'), and each move is
 executed with movej.move_j(). This script only picks which segment to run.
 
 Run (from the emio_4242 folder):
-    python emio_sort_objects.py --tune          # first: set marker colour with sliders
+    python emio_sort_objects.py --view          # live view of what the camera sees (no motion)
+    python emio_sort_objects.py --tune          # set marker colour with sliders
     python emio_sort_objects.py --calibrate     # once: all objects in their final spots, SPACE
     python emio_sort_objects.py --calibrate-one # alt: one object at a time in HOME
-    python emio_sort_objects.py --dry           # detect + classify only, robot stays still
+    python emio_sort_objects.py --dry           # detect + classify only (robot only goes to LOOK_POSE)
     python emio_sort_objects.py                 # full run
 """
 
@@ -68,6 +69,11 @@ def _split_segments(seq):
 
 
 HOME_POSE, SEGMENTS = _split_segments(POSE_SEQUENCE)
+POSE_BY_NAME = {n: a for n, a in POSE_SEQUENCE}
+# Pose (name from movej.py) the robot goes to before EVERY look at the tray
+# (tune, calibrate, dry, run) so the camera view is always the same and the
+# gripper is out of the way. Pick one where the markers are clearly visible.
+LOOK_POSE = "home"
 # After a segment, go back to 'hover' so the camera has a clear view of HOME.
 HOVER_POSE = next(a for n, a in POSE_SEQUENCE if n == "hover")
 # =========================================================================
@@ -277,6 +283,7 @@ def object_in_home(hsv, roi_mask):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    object_in_home.best_area = max((cv2.contourArea(c) for c in cnts), default=0)
     cnts = [c for c in cnts if cv2.contourArea(c) >= MIN_OBJ_AREA]
     if not cnts:
         return None, None
@@ -316,6 +323,7 @@ def grab(cam):
 def look_at_home(cam, refs=None, show=True, n_frames=5):
     """Returns (name, dist, poly) or (None, None, poly). Averages several frames."""
     sigs, poly, frame, corners = [], None, None, None
+    tray_seen, best_area = 0, 0
     for _ in range(n_frames):
         frame = grab(cam)
         if frame is None:
@@ -325,14 +333,22 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
         diag_print(corners)
         if corners is None:
             continue
+        tray_seen += 1
         roi, poly = home_roi_mask(frame.shape, corners)
         cnt, m = object_in_home(hsv, roi)
+        best_area = max(best_area, getattr(object_in_home, "best_area", 0))
         if cnt is not None:
             sigs.append(signature(hsv, cnt, m))
         time.sleep(0.05)
     name = dist = None
     if sigs and refs:
         name, dist = classify(np.mean(sigs, axis=0), refs)
+    if name is None:
+        reason = ("NO TRAY (" + corner_status() + ")" if tray_seen == 0 else
+                  f"HOME empty (largest blob {best_area:.0f}px, need {MIN_OBJ_AREA})")
+    else:
+        reason = name
+    look_at_home.reason = reason
     if show and frame is not None:
         if corners is not None:
             for num, p in section_polys(corners).items():
@@ -347,7 +363,7 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
             cv2.polylines(frame, [poly], True, (0, 255, 0), 2)
         cv2.putText(frame, corner_status(), (10, frame.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(frame, f"{name or 'empty'}", (10, 30),
+        cv2.putText(frame, reason, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
         cv2.imshow("emio sort", frame); cv2.waitKey(1)
     return (name, dist, np.mean(sigs, axis=0) if sigs else None)
@@ -369,10 +385,22 @@ def pick_and_place(emio, spot, dry):
         raise KeyError(f"movej.py has no pose{spot}_* segment")
     for name, angles in SEGMENTS[spot]:
         go(emio, name, angles, dry)
-    go(emio, "hover", HOVER_POSE, dry)
 
 
 # ---------- modes ----------
+def refs_if_any():
+    return json.load(open(SIG_FILE)) if os.path.exists(SIG_FILE) else None
+
+
+def view(cam, refs=None):
+    """Live detection view, no robot motion. q to quit."""
+    print("Live view. q to quit.")
+    while True:
+        look_at_home(cam, refs, n_frames=2)
+        if cv2.waitKey(30) & 0xFF == ord("q"):
+            return
+
+
 def tune_markers(cam):
     """Sliders for the marker HSV range. Press s to save, q to quit."""
     win = "tune (s=save, q=quit)"
@@ -480,6 +508,7 @@ def main():
     do_cal = "--calibrate" in sys.argv
     do_cal_one = "--calibrate-one" in sys.argv
     do_tune = "--tune" in sys.argv
+    do_view = "--view" in sys.argv
 
     emio = EmioAPI(multiprocess_camera=False)
     if not emio.connectToEmioDevice():
@@ -489,6 +518,11 @@ def main():
         print("Camera failed"); emio.disconnect(); return
 
     try:
+        emio.motors.max_velocity = MAX_VELOCITY
+        print(f"Moving to LOOK_POSE '{LOOK_POSE}' so the camera has a clear view.")
+        go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)  # always, even in --dry
+        if do_view:
+            view(emio.camera, refs_if_any()); return
         if do_tune:
             tune_markers(emio.camera); return
         if do_cal_one:
@@ -499,14 +533,17 @@ def main():
             print("Run with --calibrate first"); return
         refs = json.load(open(SIG_FILE))
 
-        if not dry:
-            emio.motors.max_velocity = MAX_VELOCITY
-        go(emio, "home", HOME_POSE, dry)
         placed = set()
-        for _ in range(len(OBJECTS)):
+        for i in range(len(OBJECTS)):
+            if i > 0:
+                go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)
             name, dist, _ = look_at_home(emio.camera, refs)
             if name is None:
-                print("HOME empty — done"); break
+                print("Stopping:", look_at_home.reason)
+                if "NO TRAY" in look_at_home.reason:
+                    print("  -> the camera can't see the markers from this pose. "
+                          "Set LOOK_POSE to a pose in movej.py where the tray is visible.")
+                break
             spot = OBJECT_TO_SPOT[name]
             print(f"Detected {name} (d={dist:.2f}) -> spot {spot}")
             if spot in placed:
@@ -519,7 +556,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        go(emio, "home", HOME_POSE, dry)
+        go(emio, LOOK_POSE, POSE_BY_NAME[LOOK_POSE], dry=False)
         emio.camera.close(); emio.disconnect(); cv2.destroyAllWindows()
 
 
