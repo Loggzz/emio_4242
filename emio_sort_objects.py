@@ -13,8 +13,9 @@ Pipeline per object
   3. The pick-and-place motor sequence for that spot is executed.
   4. Repeat until HOME is empty.
 
-Poses come from movej.py (same folder): hover/approach/pick/close_hover to grab
-from HOME, then poseN_hover/approach/release/open_hover for spot N.
+All motion comes from movej.py (same folder): its POSE_SEQUENCE is split into
+one segment per spot (each 'hover' ... up to the next 'hover'), and each move is
+executed with movej.move_j(). This script only picks which segment to run.
 
 Run (from the emio_4242 folder):
     python emio_sort_objects.py --tune          # first: set marker colour with sliders
@@ -29,24 +30,47 @@ import numpy as np
 import cv2
 from emioapi import EmioAPI
 
-# ======================= POSES (from movej.py) =======================
-# movej.py must sit next to this file. Its POSE_SEQUENCE is the single source
-# of truth; we index it by pose name.
-from movej import POSE_SEQUENCE
-POSES = {name: list(angles) for name, angles in POSE_SEQUENCE}
+# ======================= MOTION: all from movej.py =======================
+# movej.py (same folder) owns every motion setting: the poses, the order of
+# poses within a pick-and-place, move_j(), the settle wait, and velocity.
+# This script only decides WHICH spot's segment to run.
+import movej
+from movej import POSE_SEQUENCE, move_j
 
-HOME_POSE  = POSES["home"]
-PICK_SEQ   = ["hover", "approach", "pick", "close_hover"]
-def place_seq(spot):
-    seq = [f"pose{spot}_hover", f"pose{spot}_approach", f"pose{spot}_release"]
-    if f"pose{spot}_open_hover" in POSES:            # pose1 has no open_hover
-        seq.append(f"pose{spot}_open_hover")
-    return seq + ["hover"]                           # back over HOME, gripper open
+# Optional: add  MAX_VELOCITY = [25, 25, 25, 25]  to movej.py to control it
+# there; otherwise we use the value movej.main() uses.
+MAX_VELOCITY = getattr(movej, "MAX_VELOCITY", [25, 25, 25, 25])
 
-MAX_VELOCITY = [25, 25, 25, 25]
-MOVE_WAIT    = 5.0        # same settle time movej.py uses
-SETTLE_POLL  = True       # poll motors.moving and return early if settled
-# =====================================================================
+
+def _split_segments(seq):
+    """
+    Split POSE_SEQUENCE into one segment per spot, exactly as written in
+    movej.py. A segment starts at each 'hover' and runs until the next 'hover'.
+    The spot number is read from the 'poseN_*' names inside it.
+    Returns {spot: [(name, angles), ...]}, plus the 'home' pose.
+    """
+    home = next(a for n, a in seq if n == "home")
+    segs, cur = {}, []
+    def flush():
+        if not cur:
+            return
+        spots = {int(n[4]) for n, _ in cur if n.startswith("pose") and n[4].isdigit()}
+        if len(spots) == 1:
+            segs[spots.pop()] = list(cur)
+    for name, ang in seq:
+        if name == "home":
+            continue
+        if name == "hover":
+            flush(); cur = []
+        cur.append((name, ang))
+    flush()
+    return home, segs
+
+
+HOME_POSE, SEGMENTS = _split_segments(POSE_SEQUENCE)
+# After a segment, go back to 'hover' so the camera has a clear view of HOME.
+HOVER_POSE = next(a for n, a in POSE_SEQUENCE if n == "hover")
+# =========================================================================
 
 OBJECT_TO_SPOT = {"cheese": 2, "eggplant": 1, "burger": 6,
                   "donut": 4, "bread": 3, "tomato": 5}
@@ -330,34 +354,22 @@ def look_at_home(cam, refs=None, show=True, n_frames=5):
 
 
 # ---------- robot ----------
-def wait_settled(motors, timeout=MOVE_WAIT):
-    """Wait until motors stop moving (or timeout). Falls back to a fixed sleep."""
-    if not SETTLE_POLL:
-        time.sleep(timeout); return
-    time.sleep(0.15)
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        try:
-            if not any(bool(m) for m in motors.moving):
-                time.sleep(0.25); return
-        except AttributeError:
-            time.sleep(timeout); return
-        time.sleep(0.05)
-
-
-def go(motors, name, dry):
-    pose = POSES[name]
-    print(f"  -> {name:18s} {np.round(pose, 3).tolist()}")
-    if not dry:
-        motors.angles = [float(a) for a in pose]
-        wait_settled(motors)
-    else:
+def go(emio, name, angles, dry):
+    """One move, executed by movej.move_j (its own wait/settle logic)."""
+    print(f"  -> {name:18s} {list(angles)}")
+    if dry:
         time.sleep(0.2)
+    else:
+        move_j(angles, emio)
 
 
-def pick_and_place(motors, spot, dry):
-    for name in PICK_SEQ + place_seq(spot):
-        go(motors, name, dry)
+def pick_and_place(emio, spot, dry):
+    """Run spot N's segment exactly as it appears in movej.POSE_SEQUENCE."""
+    if spot not in SEGMENTS:
+        raise KeyError(f"movej.py has no pose{spot}_* segment")
+    for name, angles in SEGMENTS[spot]:
+        go(emio, name, angles, dry)
+    go(emio, "hover", HOVER_POSE, dry)
 
 
 # ---------- modes ----------
@@ -489,7 +501,7 @@ def main():
 
         if not dry:
             emio.motors.max_velocity = MAX_VELOCITY
-        go(emio.motors, "home", dry)
+        go(emio, "home", HOME_POSE, dry)
         placed = set()
         for _ in range(len(OBJECTS)):
             name, dist, _ = look_at_home(emio.camera, refs)
@@ -502,15 +514,14 @@ def main():
             if dry:
                 input("  dry run: move it by hand, then press Enter... ")
                 placed.add(spot); continue
-            pick_and_place(emio.motors, spot, dry)
+            pick_and_place(emio, spot, dry)
             placed.add(spot)
     except KeyboardInterrupt:
         pass
     finally:
-        go(emio.motors, "home", dry)
+        go(emio, "home", HOME_POSE, dry)
         emio.camera.close(); emio.disconnect(); cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     main()
-    
