@@ -29,7 +29,7 @@ Run (from the emio_4242 folder):
 import sys, json, os, time, math
 import numpy as np
 
-VERSION = "v16 (2026-11-02) tomato->6 burger->5, safe velocity read"
+VERSION = "v17 (2026-11-02) poll-wait motion (no fixed 5 s), brightness feature"
 print(f"emio_sort_objects {VERSION}  -  {os.path.abspath(__file__)}")
 import cv2
 from emioapi import EmioAPI
@@ -58,6 +58,14 @@ def _velocity_from_movej():
     return [25, 25, 25, 25]
 
 MAX_VELOCITY = _velocity_from_movej()
+
+# How to wait after each pose:
+#   "poll"  - send angles, wait only until the motors stop moving
+#             (cap = movej.MOVE_TIMEOUT_SECONDS). No fixed pause.
+#   "movej" - call movej.move_j exactly (uses its wait_for_motors sleep).
+WAIT_MODE = "poll"
+MOVE_TIMEOUT = float(getattr(movej, "MOVE_TIMEOUT_SECONDS", 10.0) or 10.0)
+SETTLE_PAD = 0.15              # extra seconds after motors report stopped
 
 
 def _split_segments(seq):
@@ -390,8 +398,8 @@ def object_in_home(hsv, roi_mask, depth=None):
 
 
 HUE_BINS = 36
-# Feature weights: [hue hist, mean sat, dark frac, white frac, solidity, rect, aspect]
-FEAT_W = np.array([4.0] * HUE_BINS + [2.0, 2.0, 2.5, 1.5, 1.5, 2.0])
+# Feature weights: [hue hist, mean sat, mean val, dark frac, white frac, solidity, rect, aspect]
+FEAT_W = np.array([4.0] * HUE_BINS + [2.0, 2.0, 4.0, 2.5, 1.5, 1.5, 2.0])
 
 
 def signature(hsv, cnt, mask):
@@ -416,13 +424,14 @@ def signature(hsv, cnt, mask):
     else:
         hist = np.full(HUE_BINS, 1.0 / HUE_BINS)   # colourless object: flat
     sat = px[:, 1].mean() / 255
+    val = px[:, 2].mean() / 255                      # maki (black) vs durian
     area = cv2.contourArea(cnt)
     hull = cv2.contourArea(cv2.convexHull(cnt))
     solidity = area / max(1, hull)
     (w, h) = cv2.minAreaRect(cnt)[1]
     rect = area / max(1, w * h)
     aspect = min(w, h) / max(1, max(w, h))
-    return np.concatenate([hist, [sat, dark_frac, white_frac, solidity, rect, aspect]])
+    return np.concatenate([hist, [sat, val, dark_frac, white_frac, solidity, rect, aspect]])
 
 
 def _samples(v):
@@ -516,13 +525,28 @@ def look_at_home(cam, refs=None, show=True, n_frames=8):
 
 
 # ---------- robot ----------
+def wait_motors_stopped(motors, timeout):
+    time.sleep(0.15)                                 # let the moving flag update
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            if not any(bool(m) for m in motors.moving):
+                time.sleep(SETTLE_PAD); return
+        except Exception:
+            time.sleep(timeout); return             # API has no 'moving': fixed wait
+        time.sleep(0.03)
+
+
 def go(emio, name, angles, dry):
-    """One move, executed by movej.move_j (its own wait/settle logic)."""
+    """One move. Poses always come from movej.py; only the wait differs."""
     print(f"  -> {name:18s} {list(angles)}")
     if dry:
         time.sleep(0.2)
-    else:
+    elif WAIT_MODE == "movej":
         move_j(angles, emio)
+    else:
+        emio.motors.angles = list(angles)
+        wait_motors_stopped(emio.motors, MOVE_TIMEOUT)
 
 
 def pick_and_place(emio, spot, dry):
