@@ -3,8 +3,8 @@ Emio: sort 6 play-dough objects from the tray's HOME square to their numbered sp
 
 Objects (from the photos) -> spot numbers (edit OBJECT_TO_SPOT if different):
     durian    -> 2        sushi    -> 1
-    burger    -> 6        donut    -> 4
-    maki      -> 3        tomato   -> 5
+    burger    -> 5        donut    -> 4
+    maki      -> 3        tomato   -> 6
 
 Pipeline per object
   1. Camera looks at the HOME square (centre of the tray, found from the 4 purple corners).
@@ -29,7 +29,7 @@ Run (from the emio_4242 folder):
 import sys, json, os, time, math
 import numpy as np
 
-VERSION = "v14 (2026-10-28 14:33) reliable SPACE, 3 samples in both calibrate modes"
+VERSION = "v16 (2026-11-02) tomato->6 burger->5, safe velocity read"
 print(f"emio_sort_objects {VERSION}  -  {os.path.abspath(__file__)}")
 import cv2
 from emioapi import EmioAPI
@@ -43,13 +43,18 @@ from movej import POSE_SEQUENCE, move_j
 
 def _velocity_from_movej():
     """movej.MAX_VELOCITY if defined, else the max_velocity line in movej.main()."""
-    if hasattr(movej, "MAX_VELOCITY"):
-        return [int(round(float(x))) for x in movej.MAX_VELOCITY]
-    import re
-    src = open(movej.__file__).read()
-    m = re.search(r"max_velocity\s*=\s*\[([^\]]+)\]", src)
-    if m:
-        return [int(round(float(x))) for x in m.group(1).split(",")]
+    try:
+        if hasattr(movej, "MAX_VELOCITY"):
+            return [int(round(float(x))) for x in movej.MAX_VELOCITY]
+        import re
+        src = open(movej.__file__, encoding="utf-8").read()
+        m = re.search(r"max_velocity\s*=\s*\[([^\]]+)\]", src)
+        if m:
+            vals = [int(round(float(x))) for x in m.group(1).split(",") if x.strip()]
+            if len(vals) == 4:
+                return vals
+    except Exception as e:
+        print("WARNING: could not read max_velocity from movej.py:", e)
     return [25, 25, 25, 25]
 
 MAX_VELOCITY = _velocity_from_movej()
@@ -98,8 +103,8 @@ AFTER_PLACE_LOOK = None
 HOVER_POSE = next(a for n, a in POSE_SEQUENCE if n == "hover")
 # =========================================================================
 
-OBJECT_TO_SPOT = {"durian": 2, "sushi": 1, "burger": 6,
-                  "donut": 4, "maki": 3, "tomato": 5}
+OBJECT_TO_SPOT = {"durian": 2, "sushi": 1, "burger": 5,
+                  "donut": 4, "maki": 3, "tomato": 6}
 OBJECTS = list(OBJECT_TO_SPOT)
 
 # Corner MARKERS are PURPLE. OpenCV HSV: H 0-180, S 0-255, V 0-255.
@@ -118,8 +123,10 @@ if os.path.exists(HSV_FILE):
 else:
     print(f"WARNING: no {HSV_FILE} - using default lo={MARKER_LO} hi={MARKER_HI}. "
           "Run --tune and press s.")
-MIN_OBJ_AREA = 300
-DARK_V = 70                    # pixels darker than this count as object (black)
+MIN_OBJ_AREA = 120             # small enough for the sushi's orange strip
+DARK_V = 55                    # pixels darker than this count as object (black maki)
+MAX_MATCH_DIST = 2.0
+BLUE_H = (92, 124)             # hue band of the blue tape (tray sections AND grippers)           # weaker matches than this -> "unknown", not picked
 SIG_FILE = "object_signatures.json"
 SAMPLES_PER_OBJECT = 3         # --calibrate-one: samples recorded per object
 
@@ -128,8 +135,8 @@ SAMPLES_PER_OBJECT = 3         # --calibrate-one: samples recorded per object
 # Tray as a 3x3 grid of blocks (rows top->bottom, cols left->right).
 # A section may span several blocks. "H" = home square.
 SECTIONS = [[2, 2, 1],
-            [6, "H", 1],
-            [3, 5, 4]]
+            [5, "H", 1],
+            [3, 6, 4]]
 # Orientation:
 #  - With 3 markers: the corner WITHOUT a marker is MISSING_CORNER (BR = next
 #    to section 4). This is the normal setup.
@@ -149,6 +156,9 @@ RELAX_LEVELS = (1.0, 0.7, 0.5, 0.3)   # S/V lower bounds scaled by these, in tur
 def _marker_mask(hsv, relax):
     lo = (MARKER_LO[0], int(MARKER_LO[1] * relax), int(MARKER_LO[2] * relax))
     mask = cv2.inRange(hsv, np.array(lo), np.array(MARKER_HI))
+    if BLUE_H[0] < MARKER_LO[0] < BLUE_H[1] or BLUE_H[0] < MARKER_HI[0] < BLUE_H[1]:
+        blue = cv2.inRange(hsv, np.array((BLUE_H[0], 60, 0)), np.array((BLUE_H[1], 255, 255)))
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(blue))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
 
@@ -336,7 +346,7 @@ def home_roi_mask(shape, corners):
 
 
 # ---------- object detection + signature ----------
-USE_DEPTH    = True            # also segment by height above the tray
+USE_DEPTH    = False           # depth segmentation off (adds tray noise)
 DEPTH_OBJ_MM = 6               # pixels this much closer than the tray = object
 
 
@@ -359,7 +369,7 @@ def object_in_home(hsv, roi_mask, depth=None):
     h, s, v = cv2.split(hsv)
     coloured = (s > 70) & (v > 60)
     dark = v < DARK_V                       # black objects (nori / maki)
-    blue_tape = (h > 95) & (h < 125) & (s > 70)
+    blue_tape = (h > BLUE_H[0]) & (h < BLUE_H[1]) & (s > 60)   # tape on tray + grippers
     mask = ((coloured | dark) & ~blue_tape).astype(np.uint8) * 255
     mask = cv2.bitwise_and(mask, roi_mask)
     if USE_DEPTH:
@@ -379,9 +389,9 @@ def object_in_home(hsv, roi_mask, depth=None):
     return c, m
 
 
-HUE_BINS = 18
+HUE_BINS = 36
 # Feature weights: [hue hist, mean sat, dark frac, white frac, solidity, rect, aspect]
-FEAT_W = np.array([4.0] * HUE_BINS + [2.0, 2.0, 2.5, 1.5, 0.7, 0.5])
+FEAT_W = np.array([4.0] * HUE_BINS + [2.0, 2.0, 2.5, 1.5, 1.5, 2.0])
 
 
 def signature(hsv, cnt, mask):
@@ -400,7 +410,8 @@ def signature(hsv, cnt, mask):
     if sat_sel.sum() > 0.1 * len(px):
         hist, _ = np.histogram(px[sat_sel, 0], bins=HUE_BINS, range=(0, 180))
         hist = hist.astype(float)
-        hist = hist + 0.5 * (np.roll(hist, 1) + np.roll(hist, -1))   # soft bins
+        hist = (hist + 0.6 * (np.roll(hist, 1) + np.roll(hist, -1))
+                     + 0.3 * (np.roll(hist, 2) + np.roll(hist, -2)))   # soft bins
         hist = hist / max(1e-6, hist.sum())
     else:
         hist = np.full(HUE_BINS, 1.0 / HUE_BINS)   # colourless object: flat
@@ -470,11 +481,14 @@ def look_at_home(cam, refs=None, show=True, n_frames=8):
             sigs.append(signature(hsv, cnt, m))
         time.sleep(0.05)
     name = dist = None
+    unknown = None
     if sigs and refs:
         name, dist = classify(np.mean(sigs, axis=0), refs)
+        if dist > MAX_MATCH_DIST:
+            unknown, name = f"unknown (closest {name} d={dist:.2f})", None
     if name is None:
         reason = ("NO TRAY (" + corner_status() + ")" if tray_seen == 0 else
-                  f"HOME empty (largest blob {best_area:.0f}px, need {MIN_OBJ_AREA})")
+                  unknown or f"HOME empty (largest blob {best_area:.0f}px, need {MIN_OBJ_AREA})")
     else:
         reason = name
     look_at_home.reason = reason
@@ -733,8 +747,8 @@ def main():
             if name2 != name:
                 print("  unstable detection, re-checking..."); continue
             if dry:
-                input("  dry run: move it by hand, then press Enter... ")
-                placed.add(spot); continue
+                print("  dry run: would pick & place now (robot still). Swap the object.")
+                placed.add(spot); time.sleep(3); continue
             pick_and_place(emio, spot, dry)
             placed.add(spot)
             print(f"  placed so far: {sorted(placed)}")
